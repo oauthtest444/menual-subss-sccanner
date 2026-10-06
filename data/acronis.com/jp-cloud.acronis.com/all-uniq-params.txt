@@ -1,5 +1,0 @@
-_dc
-jwt
-allow_default
-scope
-return_url

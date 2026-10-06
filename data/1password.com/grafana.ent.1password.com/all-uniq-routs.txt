@@ -1,2 +1,0 @@
-https://grafana.ent.1password.com/
-https://grafana.ent.1password.com/app

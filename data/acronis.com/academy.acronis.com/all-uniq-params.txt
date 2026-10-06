@@ -1,9 +1,0 @@
-q
-utm_source
-utm_medium
-utm_campaign
-fbclid
-sfnsn
-_gl
-page
-trk

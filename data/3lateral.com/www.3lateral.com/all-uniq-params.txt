@@ -1,7 +1,0 @@
-ref
-trk
-utm_source
-utm_medium
-utm_term
-utm_content
-utm_campaign

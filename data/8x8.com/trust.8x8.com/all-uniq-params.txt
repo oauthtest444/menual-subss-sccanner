@@ -1,4 +1,0 @@
-requestedResources
-requestAccessOpen
-s
-operation

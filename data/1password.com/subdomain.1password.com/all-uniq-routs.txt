@@ -1,2 +1,0 @@
-https://subdomain.1password.com/
-https://subdomain.1password.com/app

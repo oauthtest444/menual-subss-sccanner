@@ -1,6 +1,0 @@
-l
-a
-auth-only
-utm_medium
-utm_source
-landing-page
