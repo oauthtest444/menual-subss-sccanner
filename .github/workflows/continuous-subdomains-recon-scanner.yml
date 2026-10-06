@@ -1,0 +1,350 @@
+name: Continuous subdomains Recon Scanner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: continuous-subdomains-recon-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345 # 5 hours 45 minutes
+    env:
+      PYTHONUNBUFFERED: "1"
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            playwright-chromium-${{ runner.os }}-
+
+      - name: Install Python packages
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run checkpointed subdomain scanner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="$PWD"
+          DATA="$ROOT/data"
+          TOOLS="$ROOT/tools"
+          SUBDOMAINS_FILE="$DATA/all-subdomains.txt"
+          AUTH="$DATA/auth.txt"
+          STATE="$DATA/.scan-state-subdomains.json"
+          START_EPOCH="$(date +%s)"
+          # Keep a small margin below the hard 345-minute GitHub job limit.
+          DEADLINE="$((START_EPOCH + 342 * 60))"
+
+          mkdir -p "$DATA"
+
+          python - "$SUBDOMAINS_FILE" "$STATE" <<'PY'
+          import json, pathlib, sys
+          subs = pathlib.Path(sys.argv[1])
+          state = pathlib.Path(sys.argv[2])
+          if not state.exists():
+              state.write_text(json.dumps({
+                  "subdomain_index": 0,
+                  "stage": "bootstrap",
+                  "subdomain": "",
+              }, indent=2) + "\n")
+          PY
+
+          save_state() {
+            local subdomain="$1"
+            local stage="$2"
+            local si="$3"
+            python - "$STATE" "$subdomain" "$stage" "$si" <<'PY'
+          import json, pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          p.write_text(json.dumps({
+              "subdomain": sys.argv[2],
+              "stage": sys.argv[3],
+              "subdomain_index": int(sys.argv[4]),
+          }, indent=2) + "\n")
+          PY
+          }
+
+          # Remove a fully-scanned subdomain from all-subdomains.txt (preserves order of remaining lines).
+          remove_subdomain_from_list() {
+            local subdomain="$1"
+            python - "$SUBDOMAINS_FILE" "$subdomain" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          target = sys.argv[2].strip().lower()
+          if not path.exists():
+              sys.exit(0)
+          lines = path.read_text().splitlines()
+          new_lines = []
+          for line in lines:
+              stripped = line.strip()
+              if not stripped or stripped.startswith("#"):
+                  new_lines.append(line)
+                  continue
+              if stripped.lower() != target:
+                  new_lines.append(line)
+          path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""))
+          PY
+          }
+
+          git_commit_state() {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data
+            if ! git diff --cached --quiet; then
+              git commit -m "scanner: checkpoint $1" || true
+              git push || true
+            fi
+          }
+
+          now() { date +%s; }
+          time_left() { echo $((DEADLINE - $(now))); }
+
+          # Return 0 only if enough time remains for another stage.
+          have_time() {
+            local need="${1:-120}"
+            [[ "$(time_left)" -gt "$need" ]]
+          }
+
+          # Load subdomains preserving file order (first occurrence only, no sort).
+          mapfile -t SUBS_LIST < <(
+            awk '
+              /^[[:space:]]*(#|$)/ { next }
+              {
+                gsub(/[[:space:]]/, "", $0)
+                if ($0 == "") next
+                key = tolower($0)
+                if (!(key in seen)) {
+                  seen[key] = 1
+                  print $0
+                }
+              }
+            ' "$SUBDOMAINS_FILE"
+          )
+
+          # Load checkpoint.
+          readarray -t ST < <(python - "$STATE" <<'PY'
+          import json, pathlib, sys
+          s=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          for k in ("subdomain","stage","subdomain_index"):
+              print(s.get(k, "" if k in ("subdomain","stage") else 0))
+          PY
+          )
+          CURRENT_SUB="${ST[0]}"
+          CURRENT_STAGE="${ST[1]}"
+          SUB_INDEX="${ST[2]:-0}"
+
+          # Always start from the first subdomain in the *current* list.
+          # Resume stage only when the first subdomain matches the saved subdomain.
+          if (( ${#SUBS_LIST[@]} > 0 )); then
+            FIRST="${SUBS_LIST[0]}"
+            if [[ "$CURRENT_SUB" == "$FIRST" && "$CURRENT_STAGE" != "done-subdomain" && "$CURRENT_STAGE" != "idle" ]]; then
+              SUB_INDEX=0
+              # keep CURRENT_STAGE / CURRENT_SUB as loaded
+            else
+              SUB_INDEX=0
+              CURRENT_SUB="$FIRST"
+              CURRENT_STAGE="bootstrap"
+              save_state "$FIRST" "bootstrap" 0
+            fi
+          else
+            SUB_INDEX=0
+            CURRENT_SUB=""
+            CURRENT_STAGE="idle"
+          fi
+
+          # Clear any leftover "done-subdomain" so we do not skip the first entry.
+          if [[ "$CURRENT_STAGE" == "done-subdomain" ]]; then
+            CURRENT_STAGE="bootstrap"
+            CURRENT_SUB=""
+            SUB_INDEX=0
+          fi
+
+          while have_time 180; do
+            # Reload list each iteration so removals take effect immediately.
+            mapfile -t SUBS_LIST < <(
+              awk '
+                /^[[:space:]]*(#|$)/ { next }
+                {
+                  gsub(/[[:space:]]/, "", $0)
+                  if ($0 == "") next
+                  key = tolower($0)
+                  if (!(key in seen)) {
+                    seen[key] = 1
+                    print $0
+                  }
+                }
+              ' "$SUBDOMAINS_FILE"
+            )
+
+            if (( ${#SUBS_LIST[@]} == 0 )); then
+              echo "[+] All configured subdomains have been processed (list empty)."
+              save_state "" "idle" 0
+              git_commit_state "idle"
+              exit 0
+            fi
+
+            # Always work on the first remaining subdomain.
+            SUB_INDEX=0
+            SUB="${SUBS_LIST[$SUB_INDEX]}"
+            # Derive a parent domain folder name from the subdomain (e.g. api.example.com -> example.com)
+            # Fall back to the full hostname if it has fewer than 2 labels.
+            PARENT="$(echo "$SUB" | awk -F. '{ if (NF>=2) { print $(NF-1)"."$NF } else { print $0 } }')"
+            DOMAIN_DIR="$DATA/$PARENT"
+            SUB_DIR="$DOMAIN_DIR/$SUB"
+            mkdir -p "$SUB_DIR"
+
+            # A subdomain begins at bootstrap, unless a checkpoint says otherwise
+            # *and* it is still the first subdomain in the list.
+            if [[ "$CURRENT_SUB" != "$SUB" ]]; then
+              CURRENT_SUB="$SUB"
+              CURRENT_STAGE="bootstrap"
+              save_state "$SUB" "bootstrap" "$SUB_INDEX"
+              git_commit_state "$SUB-start"
+            fi
+
+            WORK="$DATA/.work/$PARENT/$SUB"
+            mkdir -p "$WORK"
+
+            if [[ "$CURRENT_STAGE" == "bootstrap" ]]; then
+              if ! have_time 180; then break; fi
+              echo "[*] [$SUB] Running bootstrap_url..."
+              rm -f "$WORK/bootstrap-url.txt"
+              if url="$(python3 "$TOOLS/bootstrap_url.py" "$SUB" -r 4 -t 15)"; then
+                printf '%s\n' "$url" > "$WORK/bootstrap-url.txt"
+                save_state "$SUB" "archive" "$SUB_INDEX"
+              else
+                : > "$WORK/bootstrap-url.txt"
+                save_state "$SUB" "archive" "$SUB_INDEX"
+              fi
+              echo "[+] [$SUB] bootstrap_url finished"
+              git_commit_state "$SUB-bootstrap"
+            fi
+
+            if [[ "$CURRENT_STAGE" == "archive" ]]; then
+              echo "[*] [$SUB] Fetching archive URLs..."
+              rm -f "$WORK/urls.txt" "$WORK/archive-q-urls.txt"
+              TARGET="https://$SUB/"
+              wget -qO "$WORK/urls.txt" "https://web.archive.org/cdx/search/cdx?url=${TARGET}&matchType=domain&fl=original&collapse=urlkey&output=text&filter=statuscode:200" || true
+
+              fgrep '?' "$WORK/urls.txt" |
+                egrep -i -v '\.(js|gif|jpg|jpeg|png|css|gz|svg|ico|webp|avif|bmp|txt|pdf|xml|json|map|mp4|webm|ogv|mov|mp3|wav|ogg|flac|aac|m4a|woff|woff2|ttf|otf|eot|zip|rar|7z|tar)(\?|$)' \
+                > "$WORK/archive-q-urls.txt" || true
+
+              # q-urls.txt = bootstrap 200/HTML URL + archive query URLs.
+              cat "$WORK/bootstrap-url.txt" "$WORK/archive-q-urls.txt" 2>/dev/null |
+                awk 'NF && !seen[$0]++' > "$WORK/q-urls.txt" || true
+
+              echo "[+] [$SUB] archive stage finished"
+              save_state "$SUB" "route-recon" "$SUB_INDEX"
+              git_commit_state "$SUB-archive"
+            fi
+
+            if [[ "$CURRENT_STAGE" == "route-recon" ]]; then
+              echo "[*] [$SUB] Running route_params_recon..."
+              rm -f "$SUB_DIR/all-uniq-routs.txt" "$SUB_DIR/all-uniq-params.txt"
+              rm -rf "$WORK/route-tmp"
+              mkdir -p "$WORK/route-tmp"
+              (
+                cd "$WORK/route-tmp"
+                python3 "$TOOLS/route_params_recon.py" \
+                  -f "$WORK/q-urls.txt" \
+                  -ro "$SUB_DIR/all-uniq-routs.txt" \
+                  -po "$SUB_DIR/all-uniq-params.txt" \
+                  -h "$AUTH" || true
+              )
+              rm -rf "$WORK/route-tmp"
+              echo "[+] [$SUB] route_params_recon finished"
+              save_state "$SUB" "xss" "$SUB_INDEX"
+              git_commit_state "$SUB-route-recon"
+            fi
+
+            if [[ "$CURRENT_STAGE" == "xss" ]]; then
+              echo "[*] [$SUB] Running xss_reflect_checker..."
+              rm -f "$SUB_DIR/xss-vulnerable.txt"
+              python3 "$TOOLS/xss_reflect_checker.py" \
+                -l "$SUB_DIR/all-uniq-routs.txt" \
+                -p "$SUB_DIR/all-uniq-params.txt" \
+                -o "$SUB_DIR/xss-vulnerable.txt" \
+                -hf "$AUTH" || true
+              rm -f "$SUB_DIR/xss-vulnerable.txt"
+              echo "[+] [$SUB] xss_reflect_checker finished"
+              save_state "$SUB" "listener" "$SUB_INDEX"
+              git_commit_state "$SUB-xss"
+            fi
+
+            if [[ "$CURRENT_STAGE" == "listener" ]]; then
+              echo "[*] [$SUB] Running unique_listener_scanner..."
+              rm -rf "$WORK/listener" "$SUB_DIR/unique_listener_scanner"
+              python3 "$TOOLS/unique_listener_scanner.py" \
+                -l "$SUB_DIR/all-uniq-routs.txt" \
+                -o "$WORK/listener" \
+                -hf "$AUTH" || true
+              for lf in no-validation-listener.txt p-xss-listener.txt validation-listener.txt; do
+                src="$WORK/listener/$lf"
+                if [[ -s "$src" ]]; then
+                  cp "$src" "$SUB_DIR/"
+                else
+                  rm -f "$SUB_DIR/$lf"
+                fi
+              done
+              rm -rf "$WORK/listener"
+              echo "[+] [$SUB] unique_listener_scanner finished"
+              save_state "$SUB" "complete-subdomain" "$SUB_INDEX"
+              git_commit_state "$SUB-listener"
+            fi
+
+            if [[ "$CURRENT_STAGE" == "complete-subdomain" ]]; then
+              for f in all-uniq-routs.txt all-uniq-params.txt no-validation-listener.txt p-xss-listener.txt validation-listener.txt; do
+                if [[ -e "$SUB_DIR/$f" ]] && [[ ! -s "$SUB_DIR/$f" ]]; then
+                  rm -f "$SUB_DIR/$f"
+                fi
+              done
+              rm -rf "$WORK"
+              echo "[*] [$SUB] Subdomain finished — removing from all-subdomains.txt"
+              remove_subdomain_from_list "$SUB"
+              CURRENT_SUB=""
+              CURRENT_STAGE="bootstrap"
+              SUB_INDEX=0
+              save_state "" "done-subdomain" 0
+              git_commit_state "$SUB-complete"
+            fi
+
+            # Refresh stage from state after each stage transition.
+            readarray -t ST < <(python - "$STATE" <<'PY'
+          import json, pathlib, sys
+          s=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          for k in ("subdomain","stage","subdomain_index"):
+              print(s.get(k, "" if k in ("subdomain","stage") else 0))
+          PY
+            )
+            CURRENT_SUB="${ST[0]}"
+            CURRENT_STAGE="${ST[1]}"
+            SUB_INDEX="${ST[2]:-0}"
+          done
+
+          echo "[+] Scan window ended; next manual run resumes from data/.scan-state-subdomains.json."
