@@ -42,10 +42,33 @@ except ImportError:
     raise
 
 
-WAIT_SECONDS = 10
+WAIT_SECONDS = 15
 MAX_SOURCE_FILES = 24
 MAX_FUNCTIONS = 40
 MAX_TRACE_DEPTH = 12
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Headers that break Chromium/Playwright when set via extra_http_headers
+# (taken from a Burp dump). Cookie is handled separately via the cookie jar.
+FORBIDDEN_HEADERS = {
+    "host",
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "accept-encoding",  # let Playwright/Chromium negotiate
+}
 
 # The requested strings are treated as literal strings, except the supplied
 # "window\\.open(" spelling is interpreted as window.open(.
@@ -102,6 +125,74 @@ DATA_STRINGS = [
 
 def clean_url(url: str) -> str:
     return url.strip()
+
+
+def load_headers_file(path: str) -> tuple[dict[str, str], str | None]:
+    """
+    Parse a Burp-style headers file (one 'Name: value' per line).
+
+    Returns (safe_extra_headers, cookie_header_value).
+    Cookie / Cookies is extracted for the Playwright cookie jar and is NOT
+    placed in extra_http_headers (that is a common cause of silent page
+    failures / zero listeners). Forbidden hop-by-hop headers are dropped.
+    """
+    headers: dict[str, str] = {}
+    cookie_value: str | None = None
+
+    for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        lower = key.lower()
+        if lower in ("cookie", "cookies"):
+            # Merge multiple Cookie lines if present.
+            cookie_value = (
+                value if cookie_value is None else f"{cookie_value}; {value}"
+            )
+            continue
+        if lower in FORBIDDEN_HEADERS:
+            continue
+        if lower in ("user-agent",):
+            # Handled via context user_agent param.
+            headers["User-Agent"] = value
+            continue
+        headers[key] = value
+
+    return headers, cookie_value
+
+
+def cookies_from_header(cookie_header: str, url: str) -> list[dict[str, Any]]:
+    """Turn a Cookie request-header value into Playwright add_cookies entries."""
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return []
+    domain = parsed.hostname
+    secure = parsed.scheme == "https"
+    out: list[dict[str, Any]] = []
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": "/",
+            "secure": secure,
+            "httpOnly": False,
+        })
+    return out
 
 
 def normalize_code(code: str) -> str:
@@ -552,6 +643,17 @@ async def scan(args):
     stats = ScanStats(urls_total=len(urls))
     seen: set[str] = set()
 
+    # Auth / custom headers from -hf file, or default UA + per-URL Referer.
+    extra_headers: dict[str, str] = {}
+    cookie_header: str | None = None
+    use_default_referer = True
+    if args.headers_file:
+        extra_headers, cookie_header = load_headers_file(args.headers_file)
+        use_default_referer = False
+        n_hdr = len(extra_headers) + (1 if cookie_header else 0)
+        print(f"[+] Loaded {n_hdr} header(s) from {args.headers_file}"
+              f"{' (cookies via jar)' if cookie_header else ''}")
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=not args.headed,
@@ -559,7 +661,18 @@ async def scan(args):
             args=["--disable-blink-features=AutomationControlled"],
         )
 
-        context = await browser.new_context(ignore_https_errors=args.ignore_https_errors)
+        context_kwargs: dict[str, Any] = {
+            "ignore_https_errors": args.ignore_https_errors,
+            "user_agent": DEFAULT_USER_AGENT,
+        }
+        if extra_headers:
+            ua = extra_headers.pop("User-Agent", None)
+            if ua:
+                context_kwargs["user_agent"] = ua
+            if extra_headers:
+                context_kwargs["extra_http_headers"] = dict(extra_headers)
+
+        context = await browser.new_context(**context_kwargs)
         await context.add_init_script(INIT_HOOK)
 
         # Avoid the scanner's own navigation logging from being confused with
@@ -567,6 +680,22 @@ async def scan(args):
         for index, url in enumerate(urls, 1):
             page = await context.new_page()
             print(f"[{index}/{len(urls)}] {url}")
+
+            # Install cookies for this URL's domain from the -hf Cookie header.
+            if cookie_header:
+                jar = cookies_from_header(cookie_header, url)
+                if jar:
+                    try:
+                        await context.add_cookies(jar)
+                    except Exception as e:
+                        print(f"    ! cookie install warning: {e}")
+
+            if use_default_referer:
+                # Same-subdomain Referer when no -hf file is given.
+                parsed = urlparse(url)
+                if parsed.scheme and parsed.netloc:
+                    referer = f"{parsed.scheme}://{parsed.netloc}/"
+                    await page.set_extra_http_headers({"Referer": referer})
 
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
@@ -662,6 +791,10 @@ def parse_args():
     )
     ap.add_argument("-l", "--list", required=True, help="file containing URLs/routes, one per line")
     ap.add_argument("-o", "--output", required=True, help="output directory")
+    ap.add_argument(
+        "-hf", "--headers", dest="headers_file",
+        help="Optional auth/header file, e.g. Cookies: a=b / Csrf: token"
+    )
     ap.add_argument("--headed", action="store_true", help="show Chromium while scanning")
     ap.add_argument("--chrome", default=None, help="path to Chrome/Chromium executable")
     ap.add_argument(
