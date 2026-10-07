@@ -900,8 +900,100 @@ def main():
             if (
                 reflected
                 and not (response_ct or "").strip()
-                and status in (403, 400)
+                and status in (303, 400)
             ):
                 print(
                     f"       HTTP {status} | "
-    
+                    f"empty content-type | "
+                    f"reflection ignored (browser text/plain)"
+                )
+                reflected = False
+
+            if reflected:
+
+                print()
+                print(
+                    "    🎯🎯🎯 VULNERABLE"
+                )
+
+                print(
+                    f"    HTTP status : {status}"
+                )
+
+                print(
+                    f"    Content-Type: {response_ct}"
+                )
+
+                print(
+                    f"    URL: {test_url}"
+                )
+
+                vulnerable.append(
+                    test_url
+                )
+
+                send_to_webhook(
+                    test_url,
+                    base_url,
+                )
+
+            else:
+
+                print(
+                    f"       HTTP {status} | "
+                    f"{response_ct or 'no content-type'} "
+                    f"| reflection: NO"
+                )
+
+            time.sleep(delay)
+
+    # ========================================================
+    # REMOVE DUPLICATES
+    # ========================================================
+
+    vulnerable = list(
+        dict.fromkeys(vulnerable)
+    )
+
+    # ========================================================
+    # SAVE
+    # ========================================================
+
+    with open(
+        args.output,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        for url in vulnerable:
+
+            f.write(
+                url + "\n"
+            )
+
+    print()
+    print(
+        "========================================"
+    )
+
+    print(
+        f"🎉 Scan Finished!"
+    )
+
+    print(
+        f"🎯 Vulnerable: "
+        f"{len(vulnerable)}"
+    )
+
+    print(
+        f"📄 Output: "
+        f"{args.output}"
+    )
+
+    print(
+        "========================================"
+    )
+
+
+if __name__ == "__main__":
+    main()
