@@ -1,0 +1,15 @@
+
+========================================================================================
+ROUTE: https://api.byteplus.com/api-explorer/
+EVENT: message
+FRAME: top
+CATEGORY: validation-listener.txt
+DATA MATCHES: .data, .type
+ORIGIN MATCHES: .origin
+XSS SINK MATCHES: none
+SOURCE URLS: https://res.gcloudcache.com/bp-fe/byteplus-platform-runtime/main.567be265.js, https://res.gcloudcache.com/bp-fe/volcengine-arch-platform/bp.b1ab83347f1c4d72.js
+SOURCE LOAD WARNINGS: 2
+
+--- FULL LISTENER / TRACE CODE ---
+function eT(e){if(eE.some(function(e){return"*"===e})||eE.some(function(t){return e.origin.indexOf(t)>-1})){var t=e.data;if("string"==typeof e.data)try{t=JSON.parse(e.data)}catch(e){t=void 0}if(t){var n=t.type,i=t.payload;ew[n]&&ew[n].forEach(function(t){"function"==typeof t&&t(e,i)})}}}
+========================================================================================
