@@ -1,9 +1,0 @@
-https://api.byteplus.com/api-docs/view/overview?serviceCode=ecs&version=2020-04-01
-https://api.byteplus.com/api-explorer/debug?version=2020-04-01&serviceCode=ecs
-https://api.byteplus.com/api-explorer?action=CreateCommand&groupName=Cloud+Assistant&serviceCode=ecs&version=2020-04-01
-https://api.byteplus.com/api/common/explorer/api-swagger?ServiceCode=ecs&Version=2020-04-01&APIVersion=2020-04-01&ActionName=CreateCommand
-https://api.byteplus.com/api/common/explorer/apis?ServiceCode=ecs&Version=2020-04-01&APIVersion=2020-04-01
-https://api.byteplus.com/api/common/explorer/sdk-info?ServiceCode=ecs&APIVersion=2020-04-01&APIAction=CreateCommand
-https://api.byteplus.com/api/common/explorer/versions?ServiceCode=ecs
-https://api.byteplus.com/api/common/location/describe-regions?ServiceCode=ecs
-https://api.byteplus.com/api/common/location/describe-service?ServiceCode=ecs
