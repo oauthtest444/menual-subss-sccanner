@@ -1,0 +1,180 @@
+name: Continuous Menual Scanner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: continuous-manual-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345 # 5 hours 45 minutes
+    env:
+      PYTHONUNBUFFERED: "1"
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            playwright-chromium-${{ runner.os }}-
+
+      - name: Install Python packages
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run manual scanner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ROOT="$PWD"
+          DATA="$ROOT/data"
+          RESULTS="$ROOT/results"
+          TOOLS="$ROOT/tools"
+          AUTH="$DATA/auth.txt"
+          ROUTS="$DATA/all-uniq-routs.txt"
+          PARAMS="$DATA/all-uniq-params.txt"
+          OUT_DIR="$RESULTS/manual"
+          STATE="$DATA/.scan-state-manual.json"
+          START_EPOCH="$(date +%s)"
+          # Keep a small margin below the hard 345-minute GitHub job limit.
+          DEADLINE="$((START_EPOCH + 342 * 60))"
+
+          # data/ holds only list/auth/state files; scan outputs go under results/
+          mkdir -p "$DATA" "$RESULTS" "$OUT_DIR"
+
+          git_commit_state() {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data results
+            if ! git diff --cached --quiet; then
+              git commit -m "scanner: checkpoint $1" || true
+              # Integrate remote commits first so push is a fast-forward.
+              git pull --rebase --autostash origin "$(git rev-parse --abbrev-ref HEAD)" 2>/dev/null \
+                || git pull --rebase --autostash 2>/dev/null \
+                || true
+              git push || true
+            fi
+          }
+
+          now() { date +%s; }
+          time_left() { echo $((DEADLINE - $(now))); }
+
+          have_time() {
+            local need="${1:-120}"
+            [[ "$(time_left)" -gt "$need" ]]
+          }
+
+          # Require existing non-empty all-uniq-routs.txt and all-uniq-params.txt.
+          # Skip subdomain enumeration, route_params_recon.py, and js_redirect_tester.py.
+          if [[ ! -s "$ROUTS" ]] || [[ ! -s "$PARAMS" ]]; then
+            echo "[!] data/all-uniq-routs.txt and/or data/all-uniq-params.txt missing or empty."
+            echo "[!] Manual scanner requires both files to already exist with content."
+            echo "[!] Skipping subdomain enumeration, route_params_recon, and js_redirect_tester."
+            exit 0
+          fi
+
+          echo "[+] Found data/all-uniq-routs.txt and data/all-uniq-params.txt — running remaining scan scripts only."
+          echo "[*] Skipping: subdomain_enum, route_params_recon, js_redirect_tester"
+
+          python - "$STATE" <<'PY'
+          import json, pathlib, sys
+          state = pathlib.Path(sys.argv[1])
+          if not state.exists():
+              state.write_text(json.dumps({
+                  "stage": "xss",
+              }, indent=2) + "\n")
+          PY
+
+          readarray -t ST < <(python - "$STATE" <<'PY'
+          import json, pathlib, sys
+          s=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          print(s.get("stage", "xss"))
+          PY
+          )
+          CURRENT_STAGE="${ST[0]:-xss}"
+
+          WORK="$RESULTS/.work/manual"
+          mkdir -p "$WORK"
+
+          if [[ "$CURRENT_STAGE" == "xss" ]]; then
+            if ! have_time 180; then
+              echo "[+] Scan window ended before xss stage."
+              exit 0
+            fi
+            echo "[*] [manual] Running xss_reflect_checker..."
+            rm -f "$OUT_DIR/xss-vulnerable.txt"
+            python3 "$TOOLS/xss_reflect_checker.py" \
+              -l "$ROUTS" \
+              -p "$PARAMS" \
+              -o "$OUT_DIR/xss-vulnerable.txt" \
+              -hf "$AUTH" || true
+            # Keep xss-vulnerable for scanner use in this manual mode (optional clean later).
+            echo "[+] [manual] xss_reflect_checker finished"
+            python - "$STATE" <<'PY'
+          import json, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_text(json.dumps({"stage": "listener"}, indent=2) + "\n")
+          PY
+            git_commit_state "manual-xss"
+            CURRENT_STAGE="listener"
+          fi
+
+          if [[ "$CURRENT_STAGE" == "listener" ]]; then
+            if ! have_time 180; then
+              echo "[+] Scan window ended before listener stage."
+              exit 0
+            fi
+            echo "[*] [manual] Running unique_listener_scanner..."
+            rm -rf "$WORK/listener"
+            python3 "$TOOLS/unique_listener_scanner.py" \
+              -l "$ROUTS" \
+              -o "$WORK/listener" \
+              -hf "$AUTH" || true
+            for lf in no-validation-listener.txt p-xss-listener.txt validation-listener.txt; do
+              src="$WORK/listener/$lf"
+              if [[ -s "$src" ]]; then
+                cp "$src" "$OUT_DIR/"
+              else
+                rm -f "$OUT_DIR/$lf"
+              fi
+            done
+            rm -rf "$WORK/listener"
+            echo "[+] [manual] unique_listener_scanner finished"
+            python - "$STATE" <<'PY'
+          import json, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_text(json.dumps({"stage": "done"}, indent=2) + "\n")
+          PY
+            git_commit_state "manual-listener"
+            CURRENT_STAGE="done"
+          fi
+
+          if [[ "$CURRENT_STAGE" == "done" ]]; then
+            echo "[+] Manual scan complete. Results under results/manual/"
+            rm -rf "$WORK"
+            git_commit_state "manual-complete"
+          fi
+
+          echo "[+] Manual scan window finished."
